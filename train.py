@@ -15,18 +15,18 @@ import time
 
 # ============ Configuration ============
 CONFIG = {
-    "approach": "Hybrid CNN-ViT",
-    "iteration": 2,
+    "approach": "Hybrid CNN-ViT v2",
+    "iteration": 3,
     "batch_size": 64,
-    "epochs": 80,
-    "learning_rate": 0.0005,
-    "weight_decay": 5e-4,
+    "epochs": 100,
+    "learning_rate": 0.0003,
+    "weight_decay": 1e-3,
     "device": "cuda" if torch.cuda.is_available() else "cpu",
-    "embed_dim": 192,
-    "num_heads": 6,
-    "num_layers": 4,
-    "dropout": 0.1,
-    "changes": "CNN stem for feature extraction, smaller transformer, warmup + cosine LR, augmentation",
+    "embed_dim": 256,
+    "num_heads": 8,
+    "num_layers": 6,
+    "dropout": 0.15,
+    "changes": "Larger model(256d,8h,6L), mixup, heavier weight decay, more epochs, deeper CNN stem",
 }
 
 
@@ -45,6 +45,9 @@ class ConvStem(nn.Module):
             nn.MaxPool2d(2),  # 28->14
 
             nn.Conv2d(64, 128, 3, padding=1, bias=False),
+            nn.BatchNorm2d(128),
+            nn.ReLU(),
+            nn.Conv2d(128, 128, 3, padding=1, bias=False),
             nn.BatchNorm2d(128),
             nn.ReLU(),
             nn.Conv2d(128, embed_dim, 3, padding=1, bias=False),
@@ -140,19 +143,32 @@ def get_data_loaders(batch_size):
 
 
 # ============ Training ============
-def train_one_epoch(model, loader, criterion, optimizer, device):
+def mixup_data(x, y, alpha=0.2):
+    lam = torch.distributions.Beta(alpha, alpha).sample().item() if alpha > 0 else 1.0
+    idx = torch.randperm(x.size(0), device=x.device)
+    return lam * x + (1 - lam) * x[idx], y, y[idx], lam
+
+
+def train_one_epoch(model, loader, criterion, optimizer, device, use_mixup=True):
     model.train()
     total_loss, correct, total = 0, 0, 0
     for images, labels in loader:
         images, labels = images.to(device), labels.to(device)
         optimizer.zero_grad()
-        outputs = model(images)
-        loss = criterion(outputs, labels)
+        if use_mixup:
+            mixed, ya, yb, lam = mixup_data(images, labels)
+            outputs = model(mixed)
+            loss = lam * criterion(outputs, ya) + (1 - lam) * criterion(outputs, yb)
+        else:
+            outputs = model(images)
+            loss = criterion(outputs, labels)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
         total_loss += loss.item() * images.size(0)
-        correct += (outputs.argmax(1) == labels).sum().item()
+        with torch.no_grad():
+            clean_out = model(images) if use_mixup else outputs
+            correct += (clean_out.argmax(1) == labels).sum().item()
         total += labels.size(0)
     return total_loss / total, correct / total
 
