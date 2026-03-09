@@ -1,7 +1,7 @@
 """
-SOLVE - Vision Transformer for Clothing Classification
+SOLVE - Vision Transformer (Hybrid) for Clothing Classification
 Fashion-MNIST Dataset | Target Accuracy: 0.95
-Using a small custom ViT (not pretrained, designed for 28x28 input)
+Iteration 2: CNN stem + Transformer, warm-up, stronger training
 """
 
 import torch
@@ -12,36 +12,51 @@ from torchvision import datasets, transforms
 import json
 import os
 import time
-import math
 
 # ============ Configuration ============
 CONFIG = {
-    "approach": "Vision Transformer (Custom Small ViT)",
-    "iteration": 1,
-    "batch_size": 128,
-    "epochs": 50,
-    "learning_rate": 0.001,
-    "weight_decay": 1e-4,
+    "approach": "Hybrid CNN-ViT",
+    "iteration": 2,
+    "batch_size": 64,
+    "epochs": 80,
+    "learning_rate": 0.0005,
+    "weight_decay": 5e-4,
     "device": "cuda" if torch.cuda.is_available() else "cpu",
-    "patch_size": 4,
-    "embed_dim": 256,
-    "num_heads": 8,
-    "num_layers": 6,
-    "mlp_ratio": 4,
+    "embed_dim": 192,
+    "num_heads": 6,
+    "num_layers": 4,
     "dropout": 0.1,
+    "changes": "CNN stem for feature extraction, smaller transformer, warmup + cosine LR, augmentation",
 }
 
 
 # ============ Model ============
-class PatchEmbed(nn.Module):
-    def __init__(self, img_size=28, patch_size=4, in_chans=1, embed_dim=256):
+class ConvStem(nn.Module):
+    """CNN stem to extract features before transformer"""
+    def __init__(self, in_chans=1, embed_dim=192):
         super().__init__()
-        self.num_patches = (img_size // patch_size) ** 2
-        self.proj = nn.Conv2d(in_chans, embed_dim, kernel_size=patch_size, stride=patch_size)
+        self.stem = nn.Sequential(
+            nn.Conv2d(in_chans, 64, 3, padding=1, bias=False),
+            nn.BatchNorm2d(64),
+            nn.ReLU(),
+            nn.Conv2d(64, 64, 3, padding=1, bias=False),
+            nn.BatchNorm2d(64),
+            nn.ReLU(),
+            nn.MaxPool2d(2),  # 28->14
+
+            nn.Conv2d(64, 128, 3, padding=1, bias=False),
+            nn.BatchNorm2d(128),
+            nn.ReLU(),
+            nn.Conv2d(128, embed_dim, 3, padding=1, bias=False),
+            nn.BatchNorm2d(embed_dim),
+            nn.ReLU(),
+            nn.MaxPool2d(2),  # 14->7
+        )
+        self.num_patches = 7 * 7
 
     def forward(self, x):
-        x = self.proj(x)  # (B, embed_dim, H/P, W/P)
-        x = x.flatten(2).transpose(1, 2)  # (B, num_patches, embed_dim)
+        x = self.stem(x)  # (B, embed_dim, 7, 7)
+        x = x.flatten(2).transpose(1, 2)  # (B, 49, embed_dim)
         return x
 
 
@@ -67,31 +82,32 @@ class TransformerBlock(nn.Module):
         return x
 
 
-class SmallViT(nn.Module):
-    def __init__(self, img_size=28, patch_size=4, in_chans=1, num_classes=10,
-                 embed_dim=256, num_heads=8, num_layers=6, mlp_ratio=4, dropout=0.1):
+class HybridViT(nn.Module):
+    def __init__(self, num_classes=10, embed_dim=192, num_heads=6, num_layers=4, dropout=0.1):
         super().__init__()
-        self.patch_embed = PatchEmbed(img_size, patch_size, in_chans, embed_dim)
-        num_patches = self.patch_embed.num_patches
+        self.conv_stem = ConvStem(1, embed_dim)
+        num_patches = self.conv_stem.num_patches
 
         self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + 1, embed_dim))
         self.pos_drop = nn.Dropout(dropout)
 
         self.blocks = nn.Sequential(*[
-            TransformerBlock(embed_dim, num_heads, mlp_ratio, dropout)
+            TransformerBlock(embed_dim, num_heads, 4, dropout)
             for _ in range(num_layers)
         ])
         self.norm = nn.LayerNorm(embed_dim)
-        self.head = nn.Linear(embed_dim, num_classes)
+        self.head = nn.Sequential(
+            nn.Dropout(0.3),
+            nn.Linear(embed_dim, num_classes),
+        )
 
-        # Initialize
         nn.init.trunc_normal_(self.pos_embed, std=0.02)
         nn.init.trunc_normal_(self.cls_token, std=0.02)
 
     def forward(self, x):
         B = x.size(0)
-        x = self.patch_embed(x)
+        x = self.conv_stem(x)
         cls_tokens = self.cls_token.expand(B, -1, -1)
         x = torch.cat([cls_tokens, x], dim=1)
         x = self.pos_drop(x + self.pos_embed)
@@ -155,6 +171,16 @@ def evaluate(model, loader, criterion, device):
     return total_loss / total, correct / total
 
 
+def get_lr_schedule(optimizer, warmup_epochs, total_epochs):
+    """Warmup + cosine annealing"""
+    def lr_lambda(epoch):
+        if epoch < warmup_epochs:
+            return (epoch + 1) / warmup_epochs
+        progress = (epoch - warmup_epochs) / (total_epochs - warmup_epochs)
+        return 0.5 * (1 + __import__('math').cos(__import__('math').pi * progress))
+    return optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+
 def main():
     print(f"=== SOLVE ViT - Iteration {CONFIG['iteration']} ===")
     print(f"Config: {json.dumps(CONFIG, indent=2)}")
@@ -163,15 +189,14 @@ def main():
     device = torch.device(CONFIG["device"])
     train_loader, test_loader = get_data_loaders(CONFIG["batch_size"])
 
-    model = SmallViT(
-        patch_size=CONFIG["patch_size"], embed_dim=CONFIG["embed_dim"],
-        num_heads=CONFIG["num_heads"], num_layers=CONFIG["num_layers"],
-        mlp_ratio=CONFIG["mlp_ratio"], dropout=CONFIG["dropout"],
+    model = HybridViT(
+        embed_dim=CONFIG["embed_dim"], num_heads=CONFIG["num_heads"],
+        num_layers=CONFIG["num_layers"], dropout=CONFIG["dropout"],
     ).to(device)
 
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.AdamW(model.parameters(), lr=CONFIG["learning_rate"], weight_decay=CONFIG["weight_decay"])
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=CONFIG["epochs"])
+    scheduler = get_lr_schedule(optimizer, warmup_epochs=5, total_epochs=CONFIG["epochs"])
 
     param_count = sum(p.numel() for p in model.parameters())
     print(f"Parameters: {param_count:,}")
